@@ -19,11 +19,12 @@ def create_database(db_path: str) -> sqlite3.Connection:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS lectures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lecture_number INTEGER,
+            session_type TEXT NOT NULL,
+            session_number INTEGER,
             speaker_name TEXT NOT NULL,
             timestamp TEXT NOT NULL,
             content TEXT NOT NULL,
-            UNIQUE(lecture_number, timestamp, speaker_name)
+            UNIQUE(session_type, session_number, timestamp, speaker_name)
         )
     """)
     
@@ -66,13 +67,19 @@ def create_database(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def parse_lecture_file(file_path: Path) -> List[Tuple[str, str, str, int]]:
+def parse_lecture_file(file_path: Path) -> List[Tuple[str, str, str, str, int]]:
     """Parse a lecture markdown file and extract speaker, timestamp, and content."""
     entries = []
     
-    # Extract lecture number from filename
-    match = re.search(r'lecture(\d+)\.md', file_path.name)
-    lecture_number = int(match.group(1)) if match else 0
+    # Determine session type and number from filename
+    if 'officehours' in file_path.name:
+        session_type = 'officehours'
+        match = re.search(r'officehours(\d+)\.md', file_path.name)
+        session_number = int(match.group(1)) if match else 0
+    else:
+        session_type = 'lecture'
+        match = re.search(r'lecture(\d+)\.md', file_path.name)
+        session_number = int(match.group(1)) if match else 0
     
     with open(file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
@@ -114,7 +121,7 @@ def parse_lecture_file(file_path: Path) -> List[Tuple[str, str, str, int]]:
                 
                 content = ' '.join(content_lines)
                 if content:  # Only add entries with actual content
-                    entries.append((speaker_name, timestamp, content, lecture_number))
+                    entries.append((session_type, speaker_name, timestamp, content, session_number))
                 
                 i = j
                 continue
@@ -130,20 +137,23 @@ def import_lectures(transcript_dir: str, db_path: str):
     cursor = conn.cursor()
     
     transcript_path = Path(transcript_dir)
+    # Get both lecture and office hours files
     lecture_files = sorted(transcript_path.glob('lecture*.md'))
+    officehours_files = sorted(transcript_path.glob('officehours*.md'))
+    all_files = lecture_files + officehours_files
     
     total_entries = 0
     
-    for file_path in lecture_files:
+    for file_path in all_files:
         print(f"Processing {file_path.name}...")
         entries = parse_lecture_file(file_path)
         
-        for speaker_name, timestamp, content, lecture_number in entries:
+        for session_type, speaker_name, timestamp, content, session_number in entries:
             try:
                 cursor.execute("""
-                    INSERT OR IGNORE INTO lectures (lecture_number, speaker_name, timestamp, content)
-                    VALUES (?, ?, ?, ?)
-                """, (lecture_number, speaker_name, timestamp, content))
+                    INSERT OR IGNORE INTO lectures (session_type, session_number, speaker_name, timestamp, content)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (session_type, session_number, speaker_name, timestamp, content))
                 total_entries += cursor.rowcount
             except sqlite3.Error as e:
                 print(f"Error inserting entry: {e}")
@@ -169,7 +179,7 @@ def search_lectures(db_path: str, query: str):
     
     # Search using FTS5
     cursor.execute("""
-        SELECT l.lecture_number, l.speaker_name, l.timestamp, snippet(lectures_fts, 2, '[', ']', '...', 10)
+        SELECT l.session_type, l.session_number, l.speaker_name, l.timestamp, snippet(lectures_fts, 2, '[', ']', '...', 10)
         FROM lectures l
         JOIN lectures_fts ON l.id = lectures_fts.rowid
         WHERE lectures_fts MATCH ?
@@ -195,5 +205,5 @@ if __name__ == "__main__":
     # Example search
     print("\nExample search for 'agent':")
     results = search_lectures(str(db_path), "agent")
-    for lecture_num, speaker, timestamp, snippet in results[:5]:
-        print(f"Lecture {lecture_num} - {speaker} [{timestamp}]: {snippet}")
+    for session_type, session_num, speaker, timestamp, snippet in results[:5]:
+        print(f"{session_type.capitalize()} {session_num} - {speaker} [{timestamp}]: {snippet}")

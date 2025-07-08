@@ -5,9 +5,15 @@ build/
 dist/
 wheels/
 *.egg-info
+/email-agent/
 
 # Virtual environments
 .venv
 .claude
 /lecture-transcript
 CLAUDE.md
+.env
+.cache/litellm
+CACHING_ANALYSIS.md
+generate_all_scenarios.py
+
