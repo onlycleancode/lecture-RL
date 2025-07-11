@@ -3,10 +3,14 @@ name = "lecture-rl"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
+    "accelerate>=1.7.0",
+    "datasets>=4.0.0",
     "langchain>=0.3.26",
     "litellm[caching]>=1.73.7",
+    "openpipe-art>=0.3.13",
     "pydantic>=2.11.7",
+    "skypilot>=0.9.3",
     "weave>=0.51.54",
 ]

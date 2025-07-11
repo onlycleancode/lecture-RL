@@ -13,7 +13,9 @@ wheels/
 /lecture-transcript
 CLAUDE.md
 .env
+env.example
 .cache/litellm
 CACHING_ANALYSIS.md
 generate_all_scenarios.py
+.litellm_cache
 
