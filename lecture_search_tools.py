@@ -1,4 +1,4 @@
-"""Search tools for querying lecture transcripts."""
+"""Search tools for querying lecture transcripts with enhanced semantic understanding."""
 
 import sqlite3
 from typing import List, Optional, Tuple
@@ -7,6 +7,7 @@ from project_types import LectureEntry
 from dataclasses import dataclass
 from typing import Optional
 import os
+import re
 
 # Database connection management similar to email_search_tools
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lectures.db")
@@ -34,6 +35,7 @@ class SearchResult:
 
 def search_lectures(
     keywords: Optional[List[str]] = None,
+    use_or_search: bool = False,
     session_type: Optional[str] = None,
     session_number: Optional[int] = None,
     speaker_name: Optional[str] = None,
@@ -42,21 +44,21 @@ def search_lectures(
     max_results: int = 10
 ) -> List[SearchResult]:
     """
-    Search lecture transcripts based on keywords and/or filters.
+    Enhanced search with flexible keyword matching.
     
     Args:
-        keywords: Optional list of keywords that must all appear in the content
+        keywords: List of keywords to search for
+        use_or_search: If True, match ANY keyword; if False, match ALL keywords
         session_type: Optional filter by 'lecture' or 'officehours'
         session_number: Optional session number to filter by
         speaker_name: Optional speaker name to filter by
         date_after: Optional timestamp filter 'HH:MM:SS'
         date_before: Optional timestamp filter 'HH:MM:SS'
-        max_results: Maximum number of results to return (max 10)
+        max_results: Maximum number of results to return
     
     Returns:
         List of SearchResult objects
     """
-    # Validate inputs
     if max_results > 10:
         raise ValueError("max_results must be less than or equal to 10.")
     
@@ -66,11 +68,30 @@ def search_lectures(
     where_clauses = []
     params = []
     
-    # If keywords provided, use FTS search
+    # Build FTS query based on mode
     if keywords:
-        # Build FTS query from keywords list (similar to email_search)
-        # FTS5 default is AND, so just join keywords. Escape quotes for safety.
-        fts_query = " ".join(f""" "{k.replace('"', '""')}" """ for k in keywords)
+        # Expand keywords for better matching
+        expanded_keywords = []
+        for kw in keywords:
+            expanded_keywords.append(kw.lower())
+            # Add common variations
+            if kw.lower().endswith('ing') and len(kw) > 4:
+                expanded_keywords.append(kw[:-3])  # managing -> manag
+            elif kw.lower().endswith('ies') and len(kw) > 4:
+                expanded_keywords.append(kw[:-3] + 'y')  # libraries -> library
+            elif kw.lower().endswith('ed') and len(kw) > 3:
+                expanded_keywords.append(kw[:-2])  # managed -> manag
+        
+        # Remove duplicates
+        unique_keywords = list(dict.fromkeys(expanded_keywords))
+        
+        if use_or_search:
+            # OR search - match any keyword with wildcards
+            fts_query = " OR ".join(f'"{k.replace('"', '""')}*"' for k in unique_keywords)
+        else:
+            # AND search - match all keywords with wildcards
+            fts_query = " ".join(f'"{k.replace('"', '""')}*"' for k in unique_keywords)
+        
         where_clauses.append("fts.lectures_fts MATCH ?")
         params.append(fts_query)
     
@@ -95,28 +116,27 @@ def search_lectures(
         where_clauses.append("l.timestamp < ?")
         params.append(date_before)
     
-    # Construct final query based on whether we have keywords
+    # Construct final query
     if keywords:
         # Query with FTS join
+        where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
         sql = f"""
-            SELECT 
+            SELECT DISTINCT
                 l.id,
                 l.session_type,
                 l.session_number,
                 l.speaker_name,
                 l.timestamp,
-                snippet(lectures_fts, -1, '<b>', '</b>', ' ... ', 15) as snippet
-            FROM lectures l 
+                snippet(lectures_fts, -1, '<b>', '</b>', '...', 20) as snippet
+            FROM lectures l
             JOIN lectures_fts fts ON l.id = fts.rowid
-            WHERE {" AND ".join(where_clauses)}
+            WHERE {where_clause}
             ORDER BY rank
-            LIMIT ?;
+            LIMIT ?
         """
     else:
         # Query without FTS when no keywords
-        if not where_clauses:
-            where_clauses.append("1=1")  # Ensure valid SQL
-        
+        where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
         sql = f"""
             SELECT 
                 l.id,
@@ -126,18 +146,17 @@ def search_lectures(
                 l.timestamp,
                 substr(l.content, 1, 150) || '...' as snippet
             FROM lectures l
-            WHERE {" AND ".join(where_clauses)}
+            WHERE {where_clause}
             ORDER BY l.session_type, l.session_number, l.timestamp
-            LIMIT ?;
+            LIMIT ?
         """
-    params.append(max_results)
     
-    # Execute query
+    params.append(max_results)
     cursor.execute(sql, params)
     results = cursor.fetchall()
     
     # Format results
-    formatted_results = [
+    return [
         SearchResult(
             entry_id=row[0],
             session_type=row[1],
@@ -147,8 +166,133 @@ def search_lectures(
             snippet=row[5]
         ) for row in results
     ]
+
+
+def extract_key_terms(question: str) -> List[str]:
+    """
+    Extract key terms from a natural language question.
     
-    return formatted_results
+    Args:
+        question: The question to analyze
+        
+    Returns:
+        List of key terms to search for
+    """
+    # Remove common question words
+    stop_words = {
+        'what', 'who', 'when', 'where', 'why', 'how', 'is', 'are', 'was', 'were',
+        'do', 'does', 'did', 'can', 'could', 'would', 'should', 'the', 'a', 'an',
+        'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'about',
+        'anyone', 'someone', 'something', 'anything', 'explain', 'describe'
+    }
+    
+    # Tokenize and clean
+    words = re.findall(r'\b\w+\b', question.lower())
+    
+    # Remove stop words but keep important terms
+    key_terms = []
+    for word in words:
+        if word not in stop_words and len(word) > 2:
+            key_terms.append(word)
+    
+    # Add stem variations for common patterns
+    expanded_terms = []
+    for term in key_terms:
+        expanded_terms.append(term)
+        
+        # Add common variations
+        if term.endswith('ing') and len(term) > 5:
+            expanded_terms.append(term[:-3])  # greeting -> greet
+        elif term.endswith('ed') and len(term) > 4:
+            expanded_terms.append(term[:-2])  # greeted -> greet
+            expanded_terms.append(term[:-1])  # stopped -> stoppe
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_terms = []
+    for term in expanded_terms:
+        if term not in seen:
+            seen.add(term)
+            unique_terms.append(term)
+    
+    return unique_terms
+
+
+def search_with_fallback(
+    question: str,
+    session_type: Optional[str] = None,
+    session_number: Optional[int] = None,
+    max_results: int = 10
+) -> List[SearchResult]:
+    """
+    Search with automatic fallback strategies.
+    
+    1. Try exact match with all keywords
+    2. Try OR search with keywords
+    3. Try searching in all sessions
+    4. Extract and try key terms only
+    
+    Args:
+        question: Natural language question
+        session_type: Optional session type filter
+        session_number: Optional session number filter
+        max_results: Maximum results to return
+        
+    Returns:
+        List of SearchResult objects
+    """
+    # Extract key terms from question
+    keywords = extract_key_terms(question)
+    
+    if not keywords:
+        return []
+    
+    # Strategy 1: Try AND search in specified session
+    results = search_lectures(
+        keywords=keywords,
+        use_or_search=False,
+        session_type=session_type,
+        session_number=session_number,
+        max_results=max_results
+    )
+    
+    if results:
+        return results
+    
+    # Strategy 2: Try OR search in specified session
+    results = search_lectures(
+        keywords=keywords,
+        use_or_search=True,
+        session_type=session_type,
+        session_number=session_number,
+        max_results=max_results
+    )
+    
+    if results:
+        return results
+    
+    # Strategy 3: Try AND search across all sessions
+    results = search_lectures(
+        keywords=keywords,
+        use_or_search=False,
+        session_type=None,
+        session_number=None,
+        max_results=max_results
+    )
+    
+    if results:
+        return results
+    
+    # Strategy 4: Try OR search across all sessions
+    results = search_lectures(
+        keywords=keywords,
+        use_or_search=True,
+        session_type=None,
+        session_number=None,
+        max_results=max_results
+    )
+    
+    return results
 
 
 def read_lecture(entry_id: int) -> Optional[LectureEntry]:

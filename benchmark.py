@@ -1,14 +1,16 @@
 import art
+import asyncio
 from run_agent import run_agent_and_score
 from load_scenarios import load_scenarios
 from tqdm.asyncio import tqdm
 from run_agent import ProjectTrajectory
+from typing import Optional
 
 
 async def benchmark(
-    model: art.Model, num_scenarios: int
+    model: art.Model, num_scenarios: int, seed: Optional[int] = None
 ) -> tuple[list[ProjectTrajectory], float]:
-    scenarios = load_scenarios(limit=num_scenarios, split="test")
+    scenarios = load_scenarios(limit=num_scenarios, split="test", shuffle=True, seed=seed)
     results: list[ProjectTrajectory] = await tqdm.gather(
         *[run_agent_and_score(model, scenario) for scenario in scenarios],
         desc=f"benchmarking {model.name}",
@@ -19,8 +21,8 @@ async def benchmark(
 
 async def benchmark_all_models(num_scenarios: int) -> dict[str, float]:
     model_names = [
-        "openai/gpt-4.1",
-        # "openai/gpt-4.1-mini",
+        "openai/gpt-4.1-mini",
+        #"openai/gpt-4.1-mini",
     ]
 
     models = [art.Model(name=name, project="lecture-rl") for name in model_names]
@@ -34,4 +36,4 @@ if __name__ == "__main__":
     import asyncio
     from rich import print
 
-    print(asyncio.run(benchmark_all_models(num_scenarios=5)))
+    print(asyncio.run(benchmark_all_models(num_scenarios=10)))

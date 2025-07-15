@@ -1,5 +1,6 @@
 import art
 from textwrap import dedent
+import art.trajectories
 from litellm import acompletion
 from rich import print
 import litellm
@@ -9,7 +10,7 @@ from dataclasses import asdict
 from typing import Optional
 
 from litellm.caching.caching import LiteLLMCacheType, Cache
-from lecture_search_tools import search_lectures, read_lecture, get_speaker_stats, get_session_list
+from lecture_search_tools import search_lectures, read_lecture, get_speaker_stats, get_session_list, search_with_fallback
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt
@@ -80,7 +81,7 @@ class FinalAnswer(BaseModel):
     source_ids: list[str]
 
 
-class ProjectTrajectory(art.Trajectory):
+class ProjectTrajectory(art.trajectories.Trajectory):
     final_answer: FinalAnswer | None = None
 
 
@@ -93,11 +94,39 @@ async def run_agent(model: art.Model, scenario: LectureScenario) -> ProjectTraje
     
     system_prompt = dedent(
         f"""
-        You are a lecture search agent. You are given a user query and a list of tools you can use to search lecture transcripts. Use the tools to search the lecture database and find the answer to the user's query. You may take up to {MAX_TURNS} turns to find the answer, so if your first search doesn't find the answer, you can try with different keywords.
+        You are a lecture search agent for a reinforcement learning course. Your job is to find answers to questions about lecture content.
         
-        The database contains transcripts from reinforcement learning lectures and office hours sessions.
-        Session type: {scenario.session_type}
-        Session number: {scenario.session_number}
+        The database contains transcripts from:
+        - Context: {scenario.session_type} {scenario.session_number}
+        - All lectures (1-6) and office hours (1-4)
+        
+        IMPORTANT SEARCH STRATEGIES:
+        1. Start with keywords from the question
+        2. If no results, try each important word separately
+        3. Use simpler/root forms (e.g., "greet" instead of "greeting")
+        4. Try related concepts:
+           - "start/begin/opening" for beginning
+           - "manage/handle/organize" for management
+           - "suggest/recommend/advise" for suggestions
+           - "concept/idea/notion" for concepts
+           - "explain/describe/discuss" for explanations
+        5. Search for speaker names if mentioned
+        6. Try partial words that might match (e.g., "librar" for "library/libraries")
+        7. If still no results, search all sessions with broader terms
+        
+        WHEN YOU FIND RELEVANT INFORMATION:
+        - Read the full entry with read_lecture to get complete context
+        - If the entry answers the question, immediately use return_final_answer
+        - Include the entry IDs as source references
+        
+        You have {MAX_TURNS} turns. You MUST ALWAYS use tools:
+        - Use search_lecture_natural to search with the full question (recommended first)
+        - Use search_lecture_database for specific keyword searches
+        - Use read_lecture to get full context of interesting entries
+        - Use return_final_answer when you have an answer OR when you've exhausted search options
+        - NEVER respond with plain text - always use a tool
+        
+        If you can't find information after trying different searches, use return_final_answer to say "I couldn't find information about [topic] in the lecture transcripts."
         """
     )
     
@@ -106,25 +135,66 @@ async def run_agent(model: art.Model, scenario: LectureScenario) -> ProjectTraje
         {"role": "user", "content": scenario.question},
     ]
     
-    def search_lecture_database(keywords: list[str]) -> list[dict]:
-        """Search the lecture database for entries matching the given keywords and return
-        a list of dictionaries so the LLM can easily consume them."""
+    def search_lecture_database(
+        keywords: list[str],
+        search_all_sessions: bool = False,
+        session_type: Optional[str] = None,
+        session_number: Optional[int] = None,
+        speaker_name: Optional[str] = None
+    ) -> list[dict]:
+        """Search lecture database. By default searches only the context session.
+        Set search_all_sessions=True to search across all lectures/office hours.
+        Can also filter by speaker_name.
+        
+        Pro tip: Try simpler keywords, root words, or partial matches."""
+        
+        # Determine which session(s) to search
+        if search_all_sessions:
+            search_type = None
+            search_number = None
+        else:
+            search_type = session_type or scenario.session_type
+            search_number = session_number or scenario.session_number
+            
+        # Try flexible search first
         results = search_lectures(
-            keywords=keywords,
-            session_type=scenario.session_type,
-            session_number=scenario.session_number,
+            keywords=keywords if keywords else None,
+            use_or_search=False,  # Start with AND search
+            session_type=search_type,
+            session_number=search_number,
+            speaker_name=speaker_name,
             max_results=10
         )
-        # Convert each SearchResult dataclass instance to a plain dict
+        
+        # If no results with AND, try OR search
+        if not results and keywords:
+            results = search_lectures(
+                keywords=keywords,
+                use_or_search=True,  # Try OR search
+                session_type=search_type,
+                session_number=search_number,
+                speaker_name=speaker_name,
+                max_results=10
+            )
         return [asdict(result) for result in results]
     
     def return_final_answer(
-        answer: str, reference_entry_ids: list[str]
+        answer: str, source_ids: list[str]
     ) -> FinalAnswer:
         """Return the final answer and the entry IDs of the lecture entries that were used to generate the answer."""
-        return FinalAnswer(answer=answer, source_ids=reference_entry_ids)
+        return FinalAnswer(answer=answer, source_ids=source_ids)
     
-    tools = [search_lecture_database, read_lecture, return_final_answer]
+    def search_lecture_natural(question: str, search_all_sessions: bool = False) -> list[dict]:
+        """Search using natural language question. Automatically extracts keywords and tries multiple strategies."""
+        results = search_with_fallback(
+            question=question,
+            session_type=None if search_all_sessions else scenario.session_type,
+            session_number=None if search_all_sessions else scenario.session_number,
+            max_results=10
+        )
+        return [asdict(result) for result in results]
+    
+    tools = [search_lecture_database, search_lecture_natural, read_lecture, return_final_answer]
     tools_by_name = {t.__name__: t for t in tools}
     traj.tools = [convert_to_openai_tool(t) for t in tools]  # type: ignore[attr-defined]
     
@@ -143,6 +213,7 @@ async def run_agent(model: art.Model, scenario: LectureScenario) -> ProjectTraje
             # caching=not model.trainable,
             caching=False,
             tools=traj.tools,
+            tool_choice="required",  # Force tool use
         )
         
         response_message = response.choices[0].message  # type: ignore[attr-defined]
@@ -150,9 +221,27 @@ async def run_agent(model: art.Model, scenario: LectureScenario) -> ProjectTraje
             convert_litellm_choice_to_openai(response.choices[0])  # type: ignore[attr-defined]
         )  # type: ignore[attr-defined]
         
-        if response_message.content or not response_message.tool_calls:
-            # We always want tool calls. If they're missing, the model isn't
-            # behaving how we want and we should just return the trajectory.
+        if not response_message.tool_calls:
+            # This shouldn't happen with tool_choice="required"
+            # Force a final answer if it does
+            traj.messages_and_choices.append({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "forced_final",
+                    "type": "function",
+                    "function": {
+                        "name": "return_final_answer",
+                        "arguments": json.dumps({
+                            "answer": "I was unable to process this query properly.",
+                            "source_ids": []
+                        })
+                    }
+                }]
+            })
+            traj.final_answer = FinalAnswer(
+                answer="I was unable to process this query properly.",
+                source_ids=[]
+            )
             return traj
         
         try:
@@ -176,7 +265,33 @@ async def run_agent(model: art.Model, scenario: LectureScenario) -> ProjectTraje
                         return traj
         except Exception as e:
             print(f"Error parsing tool calls: {e}")
-            return traj
+            traj.messages_and_choices.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": tool_name,
+                "content": f"Error: {str(e)}",
+            })
+    
+    # If we've exhausted all turns, force a final answer
+    if traj.final_answer is None:
+        traj.messages_and_choices.append({
+            "role": "assistant", 
+            "tool_calls": [{
+                "id": "timeout_final",
+                "type": "function",
+                "function": {
+                    "name": "return_final_answer",
+                    "arguments": json.dumps({
+                        "answer": f"I exhausted all {MAX_TURNS} search attempts but couldn't find relevant information.",
+                        "source_ids": []
+                    })
+                }
+            }]
+        })
+        traj.final_answer = FinalAnswer(
+            answer=f"I exhausted all {MAX_TURNS} search attempts but couldn't find relevant information.",
+            source_ids=[]
+        )
     
     return traj
 
@@ -186,11 +301,15 @@ async def run_agent_and_score(
     model: art.Model, scenario: LectureScenario
 ) -> ProjectTrajectory:
     traj = await run_agent(model, scenario)
+    
+    # Always invoke the judge, even if no final answer
     if traj.final_answer is None:
-        traj.reward = 0.0
-        return traj
+        candidate_answer = "No answer provided"
+    else:
+        candidate_answer = traj.final_answer.answer
+        
     correctness_judge_response = await judge_correctness(
-        scenario, traj.final_answer.answer
+        scenario, candidate_answer
     )
     traj.reward = float(correctness_judge_response.accept)
     return traj
